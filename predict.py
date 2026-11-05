@@ -9,6 +9,12 @@ BUNDLE is the tar/zip made by make_weights.py (model.pt, config.json, antibodies
 Each protein is identified by exact amino-acid sequence match against the training antibodies' FASTA
 records. Antibodies matching every record of the FASTA are preferred; otherwise any record match counts;
 several matches average their embeddings. A protein with no match gets the mean learned embedding.
+
+If config.json has a "shrink" block, proteins matched only to antibodies without KOLF training cells have
+their brightness pulled toward the KOLF average: each such protein's predictions are multiplied by
+f = (1 - lambda) + lambda * b_avg / b_pred, where b_pred is the protein's mean prediction over all its cells
+in this run (cells of one protein share a FASTA). This needs two passes; predictions are kept at model
+resolution in between.
 """
 import argparse, hashlib, json, os, sys, tarfile, tempfile, time, zipfile
 import numpy as np
@@ -102,6 +108,9 @@ def main():
     emb_w = model.emb.weight.detach()
     mean_emb = emb_w.mean(0)
     cache, stats = {}, {"exact": 0, "partial": 0, "unknown": 0}
+    shrink = cfg.get("shrink")
+    kolf_ids = {i for i, ab in enumerate(antibodies) if shrink and ab in set(shrink["kolf_antibodies"])}
+    shrink_keys = set()  # proteins matched only to antibodies without KOLF training cells
 
     def protein_embedding(fasta):
         keys = tuple(sorted(seq_key(s) for s in read_fasta(fasta)))
@@ -112,10 +121,13 @@ def main():
             sel = full or anyhit
             stats["exact" if full else "partial" if anyhit else "unknown"] += 1
             cache[keys] = emb_w[sorted(sel)].mean(0) if sel else mean_emb
-        return cache[keys]
+            if shrink and sel and not (sel & kolf_ids):
+                shrink_keys.add(keys)
+        return keys, cache[keys]
 
     ks = [0] if a.no_tta else range(8)
-    n = 0
+    P = np.empty((len(records), res, res), np.float16)  # pass 1: predictions at model resolution
+    prot = []
     for s in range(0, len(records), a.batch_size):
         batch = records[s:s + a.batch_size]
         x = []
@@ -125,18 +137,42 @@ def main():
             ch.append(load_channel(m, res) if m else np.ones((res, res), np.float32))
             x.append(np.stack(ch))
         x = torch.from_numpy(np.stack(x).astype(np.float32)).to(dev)
-        e = torch.stack([protein_embedding(r["fasta_file"]) for r in batch]).to(dev)
+        looked = [protein_embedding(r["fasta_file"]) for r in batch]
+        prot += [k for k, _ in looked]
+        e = torch.stack([v for _, v in looked]).to(dev)
         ab = torch.zeros(len(batch), dtype=torch.long, device=dev)  # unused when e is given
         dom = torch.zeros_like(ab) if use_dom else None  # always predict in the KOLF domain
         with torch.no_grad():
             p = sum(inv_dihedral(model(dihedral(x, k), ab, dom, e), k) for k in ks) / len(ks)
-            p = F.interpolate(p[:, None], size=512, mode="bilinear", align_corners=False)[:, 0].clamp(0, 1)
+        P[s:s + len(batch)] = p.cpu().numpy().astype(np.float16)
+
+    # brightness factors per protein (1 unless the protein is shrunk)
+    factor = np.ones(len(records), np.float32)
+    if shrink_keys:
+        idx_by = {}
+        for i, k in enumerate(prot):
+            idx_by.setdefault(k, []).append(i)
+        lam, b_avg = shrink["lambda"], shrink["b_avg"]
+        for k in shrink_keys:
+            ii = idx_by[k]
+            b_pred = float(np.clip(P[ii].astype(np.float32), 0, 1).mean())
+            factor[ii] = (1 - lam) + lam * b_avg / max(b_pred, 1e-6)
+
+    # pass 2: upsample, apply factors, write PNGs
+    n = 0
+    for s in range(0, len(records), a.batch_size):
+        batch = records[s:s + a.batch_size]
+        p = torch.from_numpy(P[s:s + len(batch)].astype(np.float32)).to(dev)
+        f = torch.from_numpy(factor[s:s + len(batch)]).to(dev)
+        with torch.no_grad():
+            p = F.interpolate(p[:, None], size=512, mode="bilinear", align_corners=False)[:, 0]
+            p = (p * f[:, None, None]).clamp(0, 1)
         out = np.rint(p.cpu().numpy() * 255).astype(np.uint8)
         for r, img in zip(batch, out):
             Image.fromarray(img, mode="L").save(os.path.join(a.output, f"{r['prediction_id']}.png"))
         n += len(batch)
     print(f"wrote {n} predictions in {time.time() - t0:.1f}s on {dev}; protein lookup over "
-          f"{len(cache)} distinct FASTA: {stats}", flush=True)
+          f"{len(cache)} distinct FASTA: {stats}; brightness-shrunk proteins: {len(shrink_keys)}", flush=True)
 
 
 if __name__ == "__main__":
