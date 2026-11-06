@@ -4,7 +4,9 @@ usage: predict.py --inputs-manifest MANIFEST.json --weights BUNDLE --output DIR 
 
 MANIFEST is the JSON array written by the WDL `write_json(inputs)`: one record per cell with
 prediction_id, microtubules_image, nucleus_image, er_image, fasta_file and an optional mask_image.
-BUNDLE is the tar/zip made by make_weights.py (model.pt, config.json, antibodies.txt, sequences.json).
+BUNDLE is the tar/zip made by make_weights.py (model.pt [, model_1.pt, ...], config.json, antibodies.txt,
+sequences.json). Several model files form an ensemble: each uses its own embedding table and predictions
+are averaged (after TTA, before brightness shrinkage).
 
 Each protein is identified by exact amino-acid sequence match against the training antibodies' FASTA
 records. Antibodies matching every record of the FASTA are preferred; otherwise any record match counts;
@@ -93,11 +95,14 @@ def main():
         cfg = json.load(open(os.path.join(b, "config.json")))
         antibodies = open(os.path.join(b, "antibodies.txt")).read().split()
         seq_index = json.load(open(os.path.join(b, "sequences.json")))  # {antibody: [sha256 of each FASTA record]}
-        sd = torch.load(os.path.join(b, "model.pt"), map_location="cpu")
-    model = UNet(len(antibodies), w=cfg["width"], emb=cfg["emb"])
-    model.load_state_dict(sd, strict=False)
-    use_dom = "dom.weight" in sd  # older checkpoints were trained without the domain token
-    model.to(dev).eval()
+        files = ["model.pt"] + [f"model_{i}.pt" for i in range(1, cfg.get("n_models", 1))]
+        sds = [torch.load(os.path.join(b, f), map_location="cpu") for f in files]
+    models = []
+    for sd in sds:
+        m = UNet(len(antibodies), w=cfg["width"], emb=cfg["emb"])
+        m.load_state_dict(sd, strict=False)
+        # older checkpoints were trained without the domain token
+        models.append((m.to(dev).eval(), "dom.weight" in sd))
     res = cfg["res"]
 
     # protein lookup: sequence set -> embedding (cached per FASTA content)
@@ -105,8 +110,6 @@ def main():
     for i, ab in enumerate(antibodies):
         for k in seq_index.get(ab, []):
             by_key.setdefault(k, set()).add(i)
-    emb_w = model.emb.weight.detach()
-    mean_emb = emb_w.mean(0)
     cache, stats = {}, {"exact": 0, "partial": 0, "unknown": 0}
     shrink = cfg.get("shrink")
     kolf_ids = {i for i, ab in enumerate(antibodies) if shrink and ab in set(shrink["kolf_antibodies"])}
@@ -120,7 +123,7 @@ def main():
             anyhit = set.union(*hits) if hits else set()
             sel = full or anyhit
             stats["exact" if full else "partial" if anyhit else "unknown"] += 1
-            cache[keys] = emb_w[sorted(sel)].mean(0) if sel else mean_emb
+            cache[keys] = sorted(sel)  # matched embedding rows; empty -> mean of all rows
             if shrink and sel and not (sel & kolf_ids):
                 shrink_keys.add(keys)
         return keys, cache[keys]
@@ -139,12 +142,15 @@ def main():
         x = torch.from_numpy(np.stack(x).astype(np.float32)).to(dev)
         looked = [protein_embedding(r["fasta_file"]) for r in batch]
         prot += [k for k, _ in looked]
-        e = torch.stack([v for _, v in looked]).to(dev)
         ab = torch.zeros(len(batch), dtype=torch.long, device=dev)  # unused when e is given
-        dom = torch.zeros_like(ab) if use_dom else None  # always predict in the KOLF domain
+        p = 0
         with torch.no_grad():
-            p = sum(inv_dihedral(model(dihedral(x, k), ab, dom, e), k) for k in ks) / len(ks)
-        P[s:s + len(batch)] = p.cpu().numpy().astype(np.float16)
+            for model, use_dom in models:
+                w = model.emb.weight
+                e = torch.stack([w[rows].mean(0) if rows else w.mean(0) for _, rows in looked])
+                dom = torch.zeros_like(ab) if use_dom else None  # always predict in the KOLF domain
+                p = p + sum(inv_dihedral(model(dihedral(x, k), ab, dom, e), k) for k in ks) / len(ks)
+        P[s:s + len(batch)] = (p / len(models)).cpu().numpy().astype(np.float16)
 
     # brightness factors per protein (1 unless the protein is shrunk)
     factor = np.ones(len(records), np.float32)
@@ -172,7 +178,8 @@ def main():
             Image.fromarray(img, mode="L").save(os.path.join(a.output, f"{r['prediction_id']}.png"))
         n += len(batch)
     print(f"wrote {n} predictions in {time.time() - t0:.1f}s on {dev}; protein lookup over "
-          f"{len(cache)} distinct FASTA: {stats}; brightness-shrunk proteins: {len(shrink_keys)}", flush=True)
+          f"{len(cache)} distinct FASTA: {stats}; brightness-shrunk proteins: {len(shrink_keys)}; "
+          f"models: {len(models)}", flush=True)
 
 
 if __name__ == "__main__":
