@@ -17,6 +17,11 @@ their brightness pulled toward the KOLF average: each such protein's predictions
 f = (1 - lambda) + lambda * b_avg / b_pred, where b_pred is the protein's mean prediction over all its cells
 in this run (cells of one protein share a FASTA). This needs two passes; predictions are kept at model
 resolution in between.
+
+If the bundle has esm.npz, a protein whose FASTA matches no antibody gets the mean embedding of the K
+vocabulary proteins with the most similar ESM-2 sequence vectors (cosine on standardised vectors) instead
+of the mean of all embeddings, and no brightness shrinkage. The ESM-2 model is read from $CM4AI_ESM_DIR
+(the image bakes it into /opt/esm2) or else downloaded by name.
 """
 import argparse, hashlib, json, os, sys, tarfile, tempfile, time, zipfile
 import numpy as np
@@ -97,6 +102,7 @@ def main():
         seq_index = json.load(open(os.path.join(b, "sequences.json")))  # {antibody: [sha256 of each FASTA record]}
         files = ["model.pt"] + [f"model_{i}.pt" for i in range(1, cfg.get("n_models", 1))]
         sds = [torch.load(os.path.join(b, f), map_location="cpu") for f in files]
+        esm_tab = dict(np.load(os.path.join(b, "esm.npz"))) if "esm" in cfg else None
     models = []
     for sd in sds:
         m = UNet(len(antibodies), w=cfg["width"], emb=cfg["emb"])
@@ -110,7 +116,17 @@ def main():
     for i, ab in enumerate(antibodies):
         for k in seq_index.get(ab, []):
             by_key.setdefault(k, set()).add(i)
-    cache, stats = {}, {"exact": 0, "partial": 0, "unknown": 0}
+    cache, stats = {}, {"exact": 0, "partial": 0, "esm": 0, "unknown": 0}
+    esm_model = []  # loaded on first unknown protein
+
+    def esm_neighbours(fasta):
+        if not esm_model:
+            from esm_util import ESM
+            path = os.environ.get("CM4AI_ESM_DIR") or cfg["esm"]["model"]
+            esm_model.append(ESM(path, device=str(dev)))
+        v = (esm_model[0].embed_records(read_fasta(fasta)) - esm_tab["mu"]) / esm_tab["sd"]
+        sims = esm_tab["vec"].astype(np.float32) @ (v / np.linalg.norm(v)).astype(np.float32)
+        return sorted(int(esm_tab["rows"][j]) for j in np.argsort(-sims)[:cfg["esm"]["k"]])
     shrink = cfg.get("shrink")
     kolf_ids = {i for i, ab in enumerate(antibodies) if shrink and ab in set(shrink["kolf_antibodies"])}
     shrink_keys = set()  # proteins matched only to antibodies without KOLF training cells
@@ -122,8 +138,15 @@ def main():
             full = set.intersection(*hits) if hits else set()
             anyhit = set.union(*hits) if hits else set()
             sel = full or anyhit
-            stats["exact" if full else "partial" if anyhit else "unknown"] += 1
-            cache[keys] = sorted(sel)  # matched embedding rows; empty -> mean of all rows
+            if sel:
+                stats["exact" if full else "partial"] += 1
+                cache[keys] = sorted(sel)  # matched embedding rows
+            elif esm_tab is not None:
+                stats["esm"] += 1
+                cache[keys] = esm_neighbours(fasta)  # rows of the most similar sequences; no shrinkage
+            else:
+                stats["unknown"] += 1
+                cache[keys] = []  # -> mean of all rows
             if shrink and sel and not (sel & kolf_ids):
                 shrink_keys.add(keys)
         return keys, cache[keys]
