@@ -18,11 +18,19 @@ class ESM:
     @torch.no_grad()
     def embed_seq(self, seq):
         seq = seq.strip().upper().replace("*", "")
-        acc, n = 0, 0
-        for i in range(0, len(seq), self.chunk):
-            t = self.tok(seq[i:i + self.chunk], return_tensors="pt").to(self.device)
-            h = self.model(**t).last_hidden_state[0, 1:-1]  # drop BOS/EOS
-            acc = acc + h.sum(0); n += h.shape[0]
+        # On CPU run single-threaded: multi-threaded ESM crashed with SIGILL on an AVX-only (pre-AVX2) Xeon, and
+        # only the few proteins needing the fallback go through here. GPU runs are unaffected.
+        n_threads = torch.get_num_threads()
+        if str(self.device).startswith("cpu"):
+            torch.set_num_threads(1)
+        try:
+            acc, n = 0, 0
+            for i in range(0, len(seq), self.chunk):
+                t = self.tok(seq[i:i + self.chunk], return_tensors="pt").to(self.device)
+                h = self.model(**t).last_hidden_state[0, 1:-1]  # drop BOS/EOS
+                acc = acc + h.sum(0); n += h.shape[0]
+        finally:
+            torch.set_num_threads(n_threads)
         return (acc / n).float().cpu().numpy()
 
     def embed_records(self, seqs):

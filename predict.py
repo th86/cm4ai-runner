@@ -22,6 +22,11 @@ If the bundle has esm.npz, a protein whose FASTA matches no antibody gets the me
 vocabulary proteins with the most similar ESM-2 sequence vectors (cosine on standardised vectors) instead
 of the mean of all embeddings, and no brightness shrinkage. The ESM-2 model is read from $CM4AI_ESM_DIR
 (the image bakes it into /opt/esm2) or else downloaded by name.
+
+If the bundle has annot.json (v5), every protein that does not match an antibody with KOLF training cells gets
+the mean embedding of its K nearest *other* vocabulary proteins by z-scored ESM-2 cosine plus z-scored Jaccard
+overlap of HPA localization annotations (ESM only when unannotated), with no brightness shrinkage. The gene of
+a test FASTA is found by exact sequence match to Ensembl; its annotation comes from the HPA atlas table.
 """
 import argparse, hashlib, json, os, sys, tarfile, tempfile, time, zipfile
 import numpy as np
@@ -103,6 +108,7 @@ def main():
         files = ["model.pt"] + [f"model_{i}.pt" for i in range(1, cfg.get("n_models", 1))]
         sds = [torch.load(os.path.join(b, f), map_location="cpu") for f in files]
         esm_tab = dict(np.load(os.path.join(b, "esm.npz"))) if "esm" in cfg else None
+        annot = json.load(open(os.path.join(b, "annot.json"))) if "neighbors" in cfg else None
     models = []
     for sd in sds:
         m = UNet(len(antibodies), w=cfg["width"], emb=cfg["emb"])
@@ -116,7 +122,12 @@ def main():
     for i, ab in enumerate(antibodies):
         for k in seq_index.get(ab, []):
             by_key.setdefault(k, set()).add(i)
-    cache, stats = {}, {"exact": 0, "partial": 0, "esm": 0, "unknown": 0}
+    cache, stats = {}, {"exact": 0, "partial": 0, "esm": 0, "unknown": 0, "neighbors": 0}
+    if annot:
+        nn_kolf = {i for i, ab in enumerate(antibodies) if ab in set(cfg["neighbors"]["kolf_antibodies"])}
+        vocab_locs = [set(v) for v in annot["vocab_locs"]]
+        esm_row = {int(r): j for j, r in enumerate(esm_tab["rows"])}
+        esm_vec = esm_tab["vec"].astype(np.float32)
     esm_model = []  # loaded on first unknown protein
 
     def esm_neighbours(fasta):
@@ -131,6 +142,31 @@ def main():
     kolf_ids = {i for i, ab in enumerate(antibodies) if shrink and ab in set(shrink["kolf_antibodies"])}
     shrink_keys = set()  # proteins matched only to antibodies without KOLF training cells
 
+    def esm_query(fasta, sel):
+        """Unit ESM-2 vector of the protein: stored for vocabulary proteins, computed otherwise."""
+        rows = [esm_row[r] for r in sel if r in esm_row]
+        if rows:
+            v = esm_vec[rows].mean(0)
+        else:
+            if not esm_model:
+                from esm_util import ESM
+                esm_model.append(ESM(os.environ.get("CM4AI_ESM_DIR") or cfg["esm"]["model"], device=str(dev)))
+            v = ((esm_model[0].embed_records(read_fasta(fasta)) - esm_tab["mu"]) / esm_tab["sd"]).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+    def annotation_neighbours(fasta, keys, sel):
+        locs = {l for k in keys for g in annot["seq2genes"].get(k, []) for l in annot["gene_locs"].get(g, [])}
+        if not locs:
+            locs = set().union(*(vocab_locs[r] for r in sel)) if sel else set()
+        cand = [r for r in esm_row if r not in sel]
+        es = esm_vec[[esm_row[r] for r in cand]] @ esm_query(fasta, sel)
+        z = lambda v: (v - v.mean()) / (v.std() + 1e-9)
+        score = z(es)
+        if locs:
+            js = np.array([len(locs & vocab_locs[r]) / len(locs | vocab_locs[r]) if vocab_locs[r] else 0.0 for r in cand])
+            score = score + z(js)
+        return sorted(cand[j] for j in np.argsort(-score)[:cfg["neighbors"]["k"]])
+
     def protein_embedding(fasta):
         keys = tuple(sorted(seq_key(s) for s in read_fasta(fasta)))
         if keys not in cache:
@@ -138,7 +174,10 @@ def main():
             full = set.intersection(*hits) if hits else set()
             anyhit = set.union(*hits) if hits else set()
             sel = full or anyhit
-            if sel:
+            if annot is not None and not (sel & nn_kolf):
+                stats["neighbors"] += 1
+                cache[keys] = annotation_neighbours(fasta, keys, sel)  # no shrinkage for these
+            elif sel:
                 stats["exact" if full else "partial"] += 1
                 cache[keys] = sorted(sel)  # matched embedding rows
             elif esm_tab is not None:
@@ -147,7 +186,7 @@ def main():
             else:
                 stats["unknown"] += 1
                 cache[keys] = []  # -> mean of all rows
-            if shrink and sel and not (sel & kolf_ids):
+            if shrink and sel and not (sel & kolf_ids) and annot is None:  # never shrink neighbour embeddings
                 shrink_keys.add(keys)
         return keys, cache[keys]
 
