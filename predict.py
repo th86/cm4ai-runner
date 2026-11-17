@@ -27,6 +27,12 @@ If the bundle has annot.json (v5), every protein that does not match an antibody
 the mean embedding of its K nearest *other* vocabulary proteins by z-scored ESM-2 cosine plus z-scored Jaccard
 overlap of HPA localization annotations (ESM only when unannotated), with no brightness shrinkage. The gene of
 a test FASTA is found by exact sequence match to Ensembl; its annotation comes from the HPA atlas table.
+
+If the bundle has a texture library (v6), each prediction gets alpha x a real residual (real minus predicted image
+of a KOLF training cell) added: residuals of the protein's own antibody when it has KOLF cells, otherwise of its
+K nearest KOLF proteins (same similarity as above). Requests with identical input images are treated as repeated
+predictions of one cell and get different residuals (a deterministic, cell-specific shuffle), so several
+predictions per cell differ. --no-texture switches this off.
 """
 import argparse, hashlib, json, os, sys, tarfile, tempfile, time, zipfile
 import numpy as np
@@ -94,21 +100,29 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--no-tta", action="store_true")
+    ap.add_argument("--no-texture", action="store_true", help="skip the texture library (smooth predictions)")
     a = ap.parse_args()
     t0 = time.time()
     os.makedirs(a.output, exist_ok=True)
     records = json.load(open(a.inputs_manifest))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        b = unpack(a.weights, tmp)
-        cfg = json.load(open(os.path.join(b, "config.json")))
-        antibodies = open(os.path.join(b, "antibodies.txt")).read().split()
-        seq_index = json.load(open(os.path.join(b, "sequences.json")))  # {antibody: [sha256 of each FASTA record]}
-        files = ["model.pt"] + [f"model_{i}.pt" for i in range(1, cfg.get("n_models", 1))]
-        sds = [torch.load(os.path.join(b, f), map_location="cpu") for f in files]
-        esm_tab = dict(np.load(os.path.join(b, "esm.npz"))) if "esm" in cfg else None
-        annot = json.load(open(os.path.join(b, "annot.json"))) if "neighbors" in cfg else None
+    tmpdir = tempfile.TemporaryDirectory()  # kept for the whole run: the texture library is read from it on demand
+    b = unpack(a.weights, tmpdir.name)
+    cfg = json.load(open(os.path.join(b, "config.json")))
+    antibodies = open(os.path.join(b, "antibodies.txt")).read().split()
+    seq_index = json.load(open(os.path.join(b, "sequences.json")))  # {antibody: [sha256 of each FASTA record]}
+    files = ["model.pt"] + [f"model_{i}.pt" for i in range(1, cfg.get("n_models", 1))]
+    sds = [torch.load(os.path.join(b, f), map_location="cpu") for f in files]
+    esm_tab = dict(np.load(os.path.join(b, "esm.npz"))) if "esm" in cfg else None
+    annot = json.load(open(os.path.join(b, "annot.json"))) if "neighbors" in cfg else None
+    tex = None if a.no_texture else cfg.get("texture")
+    if tex:
+        R = np.load(os.path.join(b, "residuals.npy"), mmap_mode="r")
+        row_of = {ab: i for i, ab in enumerate(antibodies)}
+        res_of = {}  # vocabulary row -> indices into R
+        for j, ab in enumerate(json.load(open(os.path.join(b, "residual_index.json")))["antibody"]):
+            res_of.setdefault(row_of[ab], []).append(j)
     models = []
     for sd in sds:
         m = UNet(len(antibodies), w=cfg["width"], emb=cfg["emb"])
@@ -123,11 +137,12 @@ def main():
         for k in seq_index.get(ab, []):
             by_key.setdefault(k, set()).add(i)
     cache, stats = {}, {"exact": 0, "partial": 0, "esm": 0, "unknown": 0, "neighbors": 0}
+    if esm_tab is not None:
+        esm_row = {int(r): j for j, r in enumerate(esm_tab["rows"])}
+        esm_vec = esm_tab["vec"].astype(np.float32)
     if annot:
         nn_kolf = {i for i, ab in enumerate(antibodies) if ab in set(cfg["neighbors"]["kolf_antibodies"])}
         vocab_locs = [set(v) for v in annot["vocab_locs"]]
-        esm_row = {int(r): j for j, r in enumerate(esm_tab["rows"])}
-        esm_vec = esm_tab["vec"].astype(np.float32)
     esm_model = []  # loaded on first unknown protein
 
     def esm_neighbours(fasta):
@@ -154,18 +169,33 @@ def main():
             v = ((esm_model[0].embed_records(read_fasta(fasta)) - esm_tab["mu"]) / esm_tab["sd"]).astype(np.float32)
         return v / np.linalg.norm(v)
 
-    def annotation_neighbours(fasta, keys, sel):
-        locs = {l for k in keys for g in annot["seq2genes"].get(k, []) for l in annot["gene_locs"].get(g, [])}
-        if not locs:
-            locs = set().union(*(vocab_locs[r] for r in sel)) if sel else set()
-        cand = [r for r in esm_row if r not in sel]
-        es = esm_vec[[esm_row[r] for r in cand]] @ esm_query(fasta, sel)
+    def nearest(fasta, keys, sel, pool, k):
+        """k rows of `pool` (minus the protein's own rows) most similar by z ESM cosine + z annotation Jaccard."""
+        cand = [r for r in pool if r not in sel and (esm_tab is None or r in esm_row)]
+        if esm_tab is None:
+            return cand[:k]
         z = lambda v: (v - v.mean()) / (v.std() + 1e-9)
-        score = z(es)
-        if locs:
-            js = np.array([len(locs & vocab_locs[r]) / len(locs | vocab_locs[r]) if vocab_locs[r] else 0.0 for r in cand])
-            score = score + z(js)
-        return sorted(cand[j] for j in np.argsort(-score)[:cfg["neighbors"]["k"]])
+        score = z(esm_vec[[esm_row[r] for r in cand]] @ esm_query(fasta, sel))
+        if annot:
+            locs = {l for kk in keys for g in annot["seq2genes"].get(kk, []) for l in annot["gene_locs"].get(g, [])}
+            if not locs:
+                locs = set().union(*(vocab_locs[r] for r in sel)) if sel else set()
+            if locs:
+                score = score + z(np.array([len(locs & vocab_locs[r]) / len(locs | vocab_locs[r]) if vocab_locs[r] else 0.0
+                                            for r in cand]))
+        return sorted(cand[j] for j in np.argsort(-score)[:k])
+
+    def annotation_neighbours(fasta, keys, sel):
+        return nearest(fasta, keys, sel, list(esm_row), cfg["neighbors"]["k"])
+
+    donors = {}  # protein -> residual indices supplying its textures
+
+    def texture_donors(fasta, keys, sel):
+        own = [j for r in sorted(sel) for j in res_of.get(r, [])]
+        if own:
+            return own
+        rows = nearest(fasta, keys, sel, sorted(res_of), tex["k"])
+        return [j for r in rows for j in res_of[r]]
 
     def protein_embedding(fasta):
         keys = tuple(sorted(seq_key(s) for s in read_fasta(fasta)))
@@ -188,6 +218,8 @@ def main():
                 cache[keys] = []  # -> mean of all rows
             if shrink and sel and not (sel & kolf_ids) and annot is None:  # never shrink neighbour embeddings
                 shrink_keys.add(keys)
+            if tex:
+                donors[keys] = texture_donors(fasta, keys, sel)
         return keys, cache[keys]
 
     ks = [0] if a.no_tta else range(8)
@@ -226,7 +258,21 @@ def main():
             b_pred = float(np.clip(P[ii].astype(np.float32), 0, 1).mean())
             factor[ii] = (1 - lam) + lam * b_avg / max(b_pred, 1e-6)
 
-    # pass 2: upsample, apply factors, write PNGs
+    # repeated requests of one cell (identical input images) get different textures
+    sample_of, cell_of, seen = [], [], {}
+    for r in records:
+        h = hashlib.sha1()
+        for c in ("nucleus_image", "microtubules_image", "er_image", "mask_image"):
+            if r.get(c):
+                h.update(open(r[c], "rb").read())
+        ck = h.hexdigest(); cell_of.append(ck); sample_of.append(seen.get(ck, 0)); seen[ck] = sample_of[-1] + 1
+
+    def texture(i):
+        d = donors[prot[i]]
+        perm = np.random.default_rng(int(hashlib.sha1((cell_of[i] + "".join(prot[i])).encode()).hexdigest()[:12], 16)).permutation(len(d))
+        return R[d[perm[sample_of[i] % len(d)]]].astype(np.float32) * (tex["scale"] / 255.0)
+
+    # pass 2: upsample, apply factors and textures, write PNGs
     n = 0
     for s in range(0, len(records), a.batch_size):
         batch = records[s:s + a.batch_size]
@@ -235,13 +281,18 @@ def main():
         with torch.no_grad():
             p = F.interpolate(p[:, None], size=512, mode="bilinear", align_corners=False)[:, 0]
             p = (p * f[:, None, None]).clamp(0, 1)
-        out = np.rint(p.cpu().numpy() * 255).astype(np.uint8)
+        p = p.cpu().numpy()
+        if tex:
+            for q in range(len(batch)):
+                p[q] = np.clip(p[q] + tex["alpha"] * texture(s + q), 0, 1)
+        out = np.rint(p * 255).astype(np.uint8)
         for r, img in zip(batch, out):
             Image.fromarray(img, mode="L").save(os.path.join(a.output, f"{r['prediction_id']}.png"))
         n += len(batch)
     print(f"wrote {n} predictions in {time.time() - t0:.1f}s on {dev}; protein lookup over "
           f"{len(cache)} distinct FASTA: {stats}; brightness-shrunk proteins: {len(shrink_keys)}; "
-          f"models: {len(models)}", flush=True)
+          f"models: {len(models)}; textured: {'alpha ' + str(tex['alpha']) if tex else 'no'}; "
+          f"cells with repeated requests: {sum(v > 1 for v in seen.values())}", flush=True)
 
 
 if __name__ == "__main__":
